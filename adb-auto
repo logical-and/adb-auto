@@ -1,0 +1,546 @@
+#!/usr/bin/env bash
+# adb-auto - find Android devices advertising wireless debugging on the LAN and
+# connect adb to all of them.
+#
+# Discovery goes through avahi-browse rather than `adb mdns services`: adb's
+# default libadbmdns backend is broken on this host and always reports an empty
+# list, while avahi resolves the same records fine.
+#
+# ADB_MDNS_OPENSCREEN=1 would also fix adb's own discovery, but it is
+# deliberately not used: that backend auto-connects devices under an mDNS-name
+# serial (adb-<guid>._adb-tls-connect._tcp), so a phone reached by ip:port shows
+# up TWICE in `adb devices`. That breaks scripts which count attached devices or
+# pick "the non-emulator one", e.g. typiq's fast-deploy.sh --device physical.
+
+set -uo pipefail
+
+BROWSE_TIMEOUT=5
+PAIR_WATCH_TIMEOUT=180
+SETTINGS_WATCH_TIMEOUT=180
+PAIR_POLL_INTERVAL=2
+STATE_MODE=0700
+SERVICE_CONNECT="_adb-tls-connect._tcp"
+SERVICE_PAIR="_adb-tls-pairing._tcp"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/adb-auto"
+STATE_FILE="$STATE_DIR/endpoints"
+IP_PORT_RE='^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]+$'
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    RED=$'\033[0;31m'; GRN=$'\033[0;32m'; YLW=$'\033[0;33m'
+    BLU=$'\033[0;34m'; DIM=$'\033[2m'; NC=$'\033[0m'
+else
+    RED=""; GRN=""; YLW=""; BLU=""; DIM=""; NC=""
+fi
+
+usage() {
+    cat <<'EOF'
+adb-auto - connect adb to Android devices on the LAN automatically
+
+Usage:
+  adb-auto            Discover and connect. When nothing is reachable it walks
+                      the bootstrap:
+                        1. shows a QR that opens Settings on the phone
+                        2. you turn Wireless debugging on
+                        3. it waits for the device, then connects
+                        4. only if the device is not paired, shows a second QR
+                           for the pairing scanner, then connects
+                      Step 4 is skipped whenever the phone is still paired.
+  adb-auto --qr       Just the pairing QR (Wireless debugging > Pair with QR)
+  adb-auto --settings Just the QR that opens Settings on the phone
+  adb-auto --pair     Pairing-code mode: waits for the phone to advertise, then
+                      prompts for the 6-digit code it displays.
+  adb-auto --list     Show what is advertised, connect to nothing
+  adb-auto --help     This message
+
+Notes:
+  Wireless debugging must be ON on the phone (Developer options > Wireless debugging).
+  Android randomises the adb port on every toggle and reboot, so the port is
+  rediscovered each run; the last working endpoint is cached as a fallback for
+  when the phone stops advertising mDNS (e.g. screen off) but keeps the port open.
+
+  Pairing cannot be made fully automatic in code mode: Android shows the 6-digit
+  secret only on the phone screen and there is no host-side way to read it. Use
+  --qr for a genuinely hands-free flow, where the host picks the secret instead.
+
+  The Settings QR opens the Settings app, not Wireless debugging directly.
+  Android only lets a scanned link open activities marked BROWSABLE, and the
+  Developer options screen is not - verified on this hardware, it refuses to
+  resolve. If a device is already attached (e.g. USB), adb-auto skips the QR
+  entirely and just turns wireless debugging on over that connection.
+EOF
+}
+
+die() { printf '%s\n' "${RED}error:${NC} $*" >&2; exit 1; }
+
+resolve_adb() {
+    if [ -n "${ADB:-}" ] && [ -x "$ADB" ]; then return; fi
+    local candidate
+    for candidate in \
+        "$(command -v adb 2>/dev/null)" \
+        "${ANDROID_HOME:-}/platform-tools/adb" \
+        "${ANDROID_SDK_ROOT:-}/platform-tools/adb" \
+        "$HOME/Android/Sdk/platform-tools/adb" \
+        "$HOME/Library/Android/sdk/platform-tools/adb"
+    do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then ADB="$candidate"; return; fi
+    done
+    die "adb not found. Set ADB=/path/to/adb or add platform-tools to PATH."
+}
+
+# Emits "ip:port<TAB>friendly-name" for each resolved IPv4 record of a service.
+# IPv6 records are skipped: adb needs bracket syntax and link-local addresses
+# additionally need a %scope suffix it does not handle.
+discover() {
+    command -v avahi-browse >/dev/null 2>&1 || return 1
+    # pipefail off locally: avahi-browse exiting nonzero (or being killed by
+    # timeout) must not discard records already parsed out of its output.
+    set +o pipefail
+    timeout "$BROWSE_TIMEOUT" avahi-browse -rpt "$1" 2>/dev/null | awk -F';' '
+        # $2 is the interface. Docker/libvirt bridges echo the same advert back
+        # on every virtual link, which on this host multiplies one device into
+        # a dozen unroutable candidates.
+        $1 == "=" && $3 == "IPv4" && $8 != "" && $9 != "" &&
+        $2 !~ /^(br-|docker|veth|virbr|lo$)/ {
+            name = $4
+            for (i = 10; i <= NF; i++)
+                if (match($i, /name=[^"]+/))
+                    name = substr($i, RSTART + 5, RLENGTH - 5)
+            print $8 ":" $9 "\t" name
+        }' | sed 's/\\032/ /g' | sort -u
+    set -o pipefail
+}
+
+adb_state() {
+    "$ADB" devices 2>/dev/null | awk -v s="$1" 'NR > 1 && $1 == s {print $2; exit}'
+}
+
+# Android listens on exactly one adb port, so any attached ip:port entry that is
+# not currently healthy - or that points at a different port on an IP we just
+# rediscovered - is a leftover from a previous toggle and pollutes `adb devices`.
+drop_stale() {
+    local discovered="$1" serial state ip dropped=0
+    while read -r serial state; do
+        [ -n "$serial" ] || continue
+        # An mDNS-name serial means an openscreen-backed adb server auto-connected
+        # this device. We also attach it by ip:port, so leaving both would list one
+        # phone twice and break "how many devices are attached" logic downstream.
+        if [[ $serial == *._adb-tls-connect._tcp ]]; then
+            printf '%s\n' "${DIM}  dropping duplicate mdns entry $serial${NC}"
+            "$ADB" disconnect "$serial" >/dev/null 2>&1
+            dropped=1
+            continue
+        fi
+        [[ $serial =~ $IP_PORT_RE ]] || continue
+        ip="${serial%%:*}"
+        if [ "$state" != "device" ]; then
+            printf '%s\n' "${DIM}  dropping stale $serial ($state)${NC}"
+            "$ADB" disconnect "$serial" >/dev/null 2>&1
+        elif [[ $'\n'$discovered$'\n' == *$'\n'"$ip:"* \
+            && $'\n'$discovered$'\n' != *$'\n'"$serial"$'\n'* ]]; then
+            printf '%s\n' "${DIM}  dropping stale $serial (port changed)${NC}"
+            "$ADB" disconnect "$serial" >/dev/null 2>&1
+        fi
+    done < <("$ADB" devices 2>/dev/null | awk 'NR > 1 && NF >= 2 {print $1, $2}')
+
+    # Dropping a transport is asynchronous. Reconnecting the same phone by
+    # ip:port too soon races the teardown and fails with "failed to connect".
+    [ "$dropped" -eq 1 ] && sleep 1
+    return 0
+}
+
+# `adb connect` reports success as soon as the TCP handshake completes, before
+# the TLS/RSA handshake has settled, so poll for the real state.
+settle_state() {
+    local serial="$1" state i
+    for i in 1 2 3 4 5 6; do
+        state=$(adb_state "$serial")
+        [ "$state" = "device" ] && { printf '%s' "$state"; return; }
+        sleep 0.5
+    done
+    printf '%s' "${state:-unknown}"
+}
+
+# Blocks until a device advertises the pairing service, then echoes every
+# resolved "ip:port<TAB>name" record. Empty output means the watch timed out.
+await_pairing_advert() {
+    local deadline=$((SECONDS + PAIR_WATCH_TIMEOUT)) found
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        found=$(discover "$SERVICE_PAIR")
+        if [ -n "$found" ]; then
+            printf '%s\n' "$found"
+            return 0
+        fi
+        sleep "$PAIR_POLL_INTERVAL"
+    done
+    return 1
+}
+
+# Pairs, then immediately connects: the pairing port is ephemeral and dies with
+# the pairing screen, so the connect endpoint must be rediscovered afterwards.
+# Takes newline-separated "ip:port<TAB>name" candidates. A single advert can
+# resolve to several addresses (multi-homed host, docker bridges), and only one
+# of them is actually routable to the phone, so each is tried in turn.
+pair_then_connect() {
+    local candidates="$1" secret="$2" name="$3" endpoint out paired=0
+    while IFS=$'\t' read -r endpoint _; do
+        [ -n "$endpoint" ] || continue
+        printf '%s\n' "${BLU}Pairing with${NC} $name ${DIM}($endpoint)${NC}"
+        out=$("$ADB" pair "$endpoint" "$secret" 2>&1)
+        if [[ $out == *"Successfully paired"* ]]; then
+            printf '%s\n' "${GRN}paired.${NC} $out"
+            paired=1
+            break
+        fi
+        printf '%s\n' "${DIM}  no luck via $endpoint: ${out}${NC}"
+    done < <(printf '%s\n' "$candidates")
+
+    if [ "$paired" -eq 0 ]; then
+        printf '%s\n' "${RED}pairing failed on every advertised address.${NC}" >&2
+        printf '%s\n' "  The code expires fast - reopen the pairing screen and retry." >&2
+        return 1
+    fi
+    printf '%s\n' "${BLU}Connecting...${NC}"
+    # The connect service can take a moment to appear after pairing completes.
+    local i
+    for i in 1 2 3 4 5 6 7 8; do
+        if [ -n "$(discover "$SERVICE_CONNECT")" ]; then break; fi
+        sleep 1
+    done
+    main_connect
+}
+
+# If a physical device is already attached by some other transport (USB, or a
+# leftover TCP session), wireless debugging can simply be switched on from here.
+# `settings put global adb_wifi_enabled 1` needs no root and makes the device
+# start advertising, which is strictly better than sending the user into menus.
+enable_wireless_on_attached() {
+    local serial
+    # main_connect calls this, and it calls main_connect back on success; the
+    # latch keeps a device that never starts advertising from looping.
+    [ "${WIRELESS_ENABLE_TRIED:-0}" -eq 1 ] && return 1
+    WIRELESS_ENABLE_TRIED=1
+
+    serial=$("$ADB" devices 2>/dev/null \
+        | awk 'NR > 1 && $2 == "device" && $1 !~ /^emulator-/ {print $1; exit}')
+    [ -n "$serial" ] || return 1
+
+    printf '%s\n' "${BLU}Device $serial is attached - enabling wireless debugging on it${NC}"
+    "$ADB" -s "$serial" shell settings put global adb_wifi_enabled 1 >/dev/null 2>&1
+    if [ "$("$ADB" -s "$serial" shell settings get global adb_wifi_enabled 2>/dev/null | tr -d '\r')" != "1" ]; then
+        printf '%s\n' "${DIM}  could not enable it remotely${NC}"
+        return 1
+    fi
+
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if [ -n "$(discover "$SERVICE_CONNECT")" ]; then
+            printf '%s\n' "${GRN}  wireless debugging is on${NC}"
+            main_connect
+            return 0
+        fi
+        sleep 1
+    done
+    printf '%s\n' "${DIM}  enabled, but nothing advertised yet${NC}"
+    return 1
+}
+
+require_qr() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 -c "import segno" 2>/dev/null || return 1
+}
+
+render_qr() {
+    python3 -c "
+import segno, sys
+segno.make(sys.argv[1], error='m').terminal(compact=True)
+" "$1"
+}
+
+# A scanned QR is handed to the OS as a browser-style navigation, so Android only
+# honours targets declaring CATEGORY_BROWSABLE. Verified on this hardware:
+# APPLICATION_DEVELOPMENT_SETTINGS (Developer options) does NOT declare it and
+# fails to resolve, so a QR cannot deep-link to Wireless debugging directly.
+# android.settings.SETTINGS is browsable and does launch, so that is the target;
+# the last two taps have to be manual.
+settings_qr() {
+    require_qr || return 1
+    render_qr "intent://#Intent;action=android.settings.SETTINGS;end"
+}
+
+# Blocks until a service is advertised, echoing its records. Empty means timeout.
+# For the connect service the advert alone is not trusted: avahi keeps serving a
+# cached record after wireless debugging goes off, so the port is probed and only
+# a record we can actually open a socket to counts.
+await_service() {
+    local service="$1" limit="$2" deadline found live
+    deadline=$((SECONDS + limit))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        found=$(discover "$service")
+        if [ -n "$found" ]; then
+            if [ "$service" != "$SERVICE_CONNECT" ]; then
+                printf '%s\n' "$found"
+                return 0
+            fi
+            live=$(printf '%s\n' "$found" | while IFS=$'\t' read -r ep nm; do
+                [ -n "$ep" ] || continue
+                if port_open "$ep"; then printf '%s\t%s\n' "$ep" "$nm"; fi
+            done)
+            if [ -n "$live" ]; then
+                printf '%s\n' "$live"
+                return 0
+            fi
+        fi
+        sleep "$PAIR_POLL_INTERVAL"
+    done
+    return 1
+}
+
+port_open() {
+    local hostport="$1"
+    timeout 2 bash -c "cat < /dev/null > /dev/tcp/${hostport%:*}/${hostport##*:}" 2>/dev/null
+}
+
+# The staged bootstrap for a phone that is not reachable at all:
+#   1. QR that opens Settings, so wireless debugging can be switched on
+#   2. wait for the device to start advertising, then just try connecting
+#   3. only if that fails (never paired, or pairing dropped) show the pairing QR
+# Step 3 is skipped whenever the phone is still paired with this machine, which
+# is the common case after a reboot or a wireless-debugging toggle.
+bootstrap_flow() {
+    [ "${BOOTSTRAP_TRIED:-0}" -eq 1 ] && return 1
+    BOOTSTRAP_TRIED=1
+    require_qr || return 1
+
+    printf '\n%s\n' "${BLU}Step 1/2 - scan to open Settings on the phone${NC}"
+    printf '%s\n' "${DIM}  then: Developer options > Wireless debugging > ON${NC}"
+    echo
+    settings_qr
+    echo
+    printf '%s\n' "${DIM}Waiting for wireless debugging to come on (${SETTINGS_WATCH_TIMEOUT}s)...${NC}"
+
+    if ! await_service "$SERVICE_CONNECT" "$SETTINGS_WATCH_TIMEOUT" >/dev/null; then
+        die "the device never started advertising. Check it is on this network
+       and that Developer options > Wireless debugging is ON."
+    fi
+
+    printf '%s\n' "${GRN}Wireless debugging is on.${NC}"
+    printf '%s\n' "${BLU}Step 2/2 - connecting${NC}"
+    # main_connect falls through to the pairing QR by itself when the device
+    # turns out not to be paired, which is the optional step 3.
+    main_connect
+}
+
+# Pairing-code mode. Android shows the 6-digit secret only on the phone screen,
+# so it cannot be read from here - everything else (endpoint, port, timing) is
+# automatic, and pairing fires as soon as the code is entered.
+do_pair() {
+    local found endpoint name code
+    printf '%s\n' "${BLU}Waiting for a device in pairing mode...${NC}"
+    printf '%s\n' "${DIM}  On the phone: Developer options > Wireless debugging >" \
+                  "  Pair device with pairing code${NC}"
+    found=$(await_pairing_advert) || die "no device started advertising pairing within ${PAIR_WATCH_TIMEOUT}s."
+    endpoint=$(printf '%s\n' "$found" | head -1 | cut -f1)
+    name=$(printf '%s\n' "$found" | head -1 | cut -f2)
+    printf '%s\n' "${GRN}detected${NC} $name at $endpoint"
+    read -r -p "Enter the 6-digit code shown on the phone: " code
+    [ -n "$code" ] || die "no code entered"
+    pair_then_connect "$found" "$code" "$name"
+}
+
+# QR mode is the only fully hands-free path: here the HOST generates the shared
+# secret and the phone's camera reads it, so nothing has to be typed.
+# Payload format (WPA3-derived, see AdbQrCode.java): WIFI:T:ADB;S:<name>;P:<secret>;;
+# The phone starts a pairing server whose mDNS instance name is the S: value,
+# which is what lets us recognise our own QR scan rather than some other device.
+do_pair_qr() {
+    local instance secret payload found name deadline
+    require_qr || die "QR pairing needs python3 + segno: python3 -m pip install --user segno"
+
+    instance="studio-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c10)"
+    secret=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c12)
+    payload="WIFI:T:ADB;S:${instance};P:${secret};;"
+
+    printf '%s\n' "${BLU}Scan this with the phone's pairing scanner:${NC}"
+    printf '%s\n' "${DIM}  Wireless debugging > Pair device with QR code${NC}"
+    echo
+    render_qr "$payload" || die "failed to render QR code"
+    echo
+    printf '%s\n' "${DIM}Waiting for the scan (${PAIR_WATCH_TIMEOUT}s)...${NC}"
+
+    # Match on our own instance name so a different phone pairing at the same
+    # time cannot hijack this secret.
+    deadline=$((SECONDS + PAIR_WATCH_TIMEOUT))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        found=$(discover "$SERVICE_PAIR" | grep -F "$instance")
+        if [ -n "$found" ]; then
+            name=$(printf '%s\n' "$found" | head -1 | cut -f2)
+            printf '%s\n' "${GRN}QR scanned${NC} by $name"
+            pair_then_connect "$found" "$secret" "$name"
+            return
+        fi
+        sleep "$PAIR_POLL_INTERVAL"
+    done
+    die "no device scanned the QR code within ${PAIR_WATCH_TIMEOUT}s."
+}
+
+main_connect() {
+    local list_only="${1:-0}"
+    local found endpoints
+
+    found=$(discover "$SERVICE_CONNECT")
+    if [ -z "$found" ] && ! command -v avahi-browse >/dev/null 2>&1; then
+        printf '%s\n' "${YLW}warning:${NC} avahi-browse missing, discovery unavailable" >&2
+    fi
+
+    if [ -n "$found" ]; then
+        printf '%s\n' "${BLU}Advertised on the LAN:${NC}"
+        printf '%s\n' "$found" | while IFS=$'\t' read -r ep nm; do
+            printf '  %s  %s\n' "$ep" "${DIM}$nm${NC}"
+        done
+        endpoints=$(printf '%s\n' "$found" | cut -f1)
+    elif [ -s "$STATE_FILE" ]; then
+        # The phone stops advertising when the screen sleeps but usually keeps
+        # the adb port open, so the last known endpoint is worth one attempt.
+        # A cached port goes stale on every toggle, so a failure here is not
+        # evidence that pairing was lost - suppress the re-pair prompt.
+        printf '%s\n' "${YLW}Nothing advertised, trying last known endpoint${NC}"
+        endpoints=$(cat "$STATE_FILE")
+        PAIR_RETRY_TRIED=1
+    else
+        # Nothing to connect to. If a device is sitting on the pairing screen
+        # right now, that is almost certainly what the user wants, so handle it
+        # instead of failing with instructions.
+        if [ -n "$(discover "$SERVICE_PAIR")" ]; then
+            printf '%s\n' "${YLW}No paired device, but one is waiting to pair.${NC}"
+            do_pair
+            return
+        fi
+        [ "$list_only" -eq 1 ] && { printf '%s\n' "${YLW}Nothing advertised.${NC}"; return 0; }
+
+        # A device already on USB (or an unrelated transport) can have wireless
+        # debugging switched on from here, which is faster and more reliable
+        # than asking the user to walk the Settings tree.
+        if enable_wireless_on_attached; then
+            return
+        fi
+
+        printf '%s\n' "${YLW}No device is advertising wireless debugging.${NC}"
+        if bootstrap_flow; then
+            return 0
+        fi
+        die "no device found. Check that the phone is on this network and that
+       Developer options > Wireless debugging is ON. If it has never been
+       paired with this machine, run: adb-auto --pair"
+    fi
+
+    [ "$list_only" -eq 1 ] && return 0
+
+    drop_stale "$endpoints"
+
+    local endpoint state reply ok=0 unreachable=0 connected=""
+    while read -r endpoint; do
+        [ -n "$endpoint" ] || continue
+        # Captured rather than piped into grep -q: with pipefail, grep exiting
+        # early on a match SIGPIPEs adb and the pipeline reports failure on a
+        # successful connect.
+        reply=$("$ADB" connect "$endpoint" 2>&1)
+        if [[ $reply != connected\ to* && $reply != already\ connected\ to* ]]; then
+            # One retry: a transport released moments earlier can still refuse
+            # the first attempt.
+            sleep 1
+            reply=$("$ADB" connect "$endpoint" 2>&1)
+        fi
+        if [[ $reply != connected\ to* && $reply != already\ connected\ to* ]]; then
+            printf '%s\n' "${RED}  failed${NC} $endpoint ${DIM}${reply}${NC}"
+            # "Connection refused" means nothing is listening on that port, i.e.
+            # wireless debugging is OFF (or the advert is a stale mDNS cache
+            # entry for a port Android has since dropped). That is a completely
+            # different problem from a device that answers but refuses to
+            # authenticate, which is what a lost pairing looks like.
+            [[ $reply == *"Connection refused"* || $reply == *"No route to host"* \
+               || $reply == *"timed out"* ]] && unreachable=1
+            continue
+        fi
+        state=$(settle_state "$endpoint")
+        case "$state" in
+            device)
+                printf '%s\n' "${GRN}  connected${NC} $endpoint"
+                connected+="$endpoint"$'\n'
+                ok=1
+                ;;
+            offline)
+                # Cycling wireless debugging or rebooting the phone invalidates
+                # the RSA pairing; nothing on this side can restore it.
+                printf '%s\n' "${RED}  offline${NC} $endpoint - pairing was dropped by Android."
+                printf '%s\n' "  Re-pair on the phone, then run: ${BLU}adb-auto --pair${NC}"
+                "$ADB" disconnect "$endpoint" >/dev/null 2>&1
+                ;;
+            unauthorized)
+                printf '%s\n' "${RED}  unauthorized${NC} $endpoint - accept the debugging prompt on the phone."
+                ;;
+            *)
+                printf '%s\n' "${RED}  $state${NC} $endpoint"
+                ;;
+        esac
+    done < <(printf '%s\n' "$endpoints")
+
+    if [ -n "$connected" ]; then
+        mkdir -p "$STATE_DIR" && chmod "$STATE_MODE" "$STATE_DIR" 2>/dev/null
+        printf '%s' "$connected" > "$STATE_FILE"
+    fi
+
+    if [ "$ok" -eq 0 ] && [ "${PAIR_RETRY_TRIED:-0}" -eq 0 ] && require_qr; then
+        PAIR_RETRY_TRIED=1
+        if [ "$unreachable" -eq 1 ]; then
+            # Nothing is listening. avahi keeps serving a cached record for a
+            # while after wireless debugging is switched off, so an advert here
+            # proves nothing - the fix is to turn it back on, not to re-pair.
+            printf '\n%s\n' "${YLW}Nothing is listening on that port - wireless debugging looks OFF.${NC}"
+            printf '%s\n' "${DIM}(the advert was a stale mDNS record)${NC}"
+            if bootstrap_flow; then
+                return 0
+            fi
+            # bootstrap already ran this session, so the QR is on screen above.
+            die "wireless debugging still appears to be off on the device."
+        fi
+        # The port answered but the handshake was rejected: that is a lost RSA
+        # pairing, which only re-pairing can fix.
+        printf '\n%s\n' "${YLW}Reachable but refusing to connect - the pairing was dropped.${NC}"
+        printf '%s\n' "${DIM}Re-pair by scanning this:${NC}"
+        echo
+        do_pair_qr
+        return
+    fi
+
+    printf '\n%s\n' "${BLU}adb devices:${NC}"
+    "$ADB" devices -l | tail -n +2 | grep -v '^\s*$'
+
+    [ "$ok" -eq 1 ]
+}
+
+main() {
+    local list_only=0
+    case "${1:-}" in
+        -h|--help) usage; exit 0 ;;
+        --list)    list_only=1 ;;
+        --pair)    resolve_adb; "$ADB" start-server >/dev/null 2>&1; do_pair; exit $? ;;
+        --qr)      resolve_adb; "$ADB" start-server >/dev/null 2>&1; do_pair_qr; exit $? ;;
+        --settings)
+            resolve_adb
+            require_qr || die "needs python3 + segno: python3 -m pip install --user segno"
+            printf '%s\n' "${BLU}Scan to open Settings on the phone${NC}"
+            printf '%s\n' "${DIM}  then: Developer options > Wireless debugging > ON${NC}"
+            echo
+            settings_qr
+            exit 0
+            ;;
+        "")        ;;
+        *)         usage >&2; exit 1 ;;
+    esac
+
+    resolve_adb
+    "$ADB" start-server >/dev/null 2>&1
+    main_connect "$list_only"
+}
+
+main "$@"
