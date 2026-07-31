@@ -269,10 +269,16 @@ segno.make(sys.argv[1], error='m').terminal(compact=True)
 # Landing on the Settings root still leaves the user to find Developer options,
 # so the QR bought nothing over simply printing the path.
 settings_hint() {
-    printf '%s\n' "${BLU}Turn on wireless debugging on the phone:${NC}"
-    printf '%s\n' "  Settings > Developer options > Wireless debugging > ON"
-    printf '%s\n' "${DIM}  (Developer options is hidden until you tap" \
-                  "   Settings > About phone > Software information > Build number 7x)${NC}"
+    printf '%s\n' "${BLU}On the phone, turn wireless debugging on:${NC}"
+    printf '%s\n' "  ${BLU}1.${NC} Settings > Developer options"
+    printf '%s\n' "  ${BLU}2.${NC} Wireless debugging > toggle ON"
+    printf '%s\n' "  ${BLU}3.${NC} (first time only) Wireless debugging >"
+    printf '%s\n' "     Pair device with QR code"
+    echo
+    printf '%s\n' "${DIM}  Samsung: Developer options sits at the bottom of the main" \
+                  "  Settings list. If it is missing, enable it with" \
+                  "  Settings > About phone > Software information >" \
+                  "  tap 'Build number' 7 times.${NC}"
 }
 
 # Blocks until a service is advertised, echoing its records. Empty means timeout.
@@ -409,7 +415,7 @@ main_connect() {
         # evidence that pairing was lost - suppress the re-pair prompt.
         printf '%s\n' "${YLW}Nothing advertised, trying last known endpoint${NC}"
         endpoints=$(cat "$STATE_FILE")
-        PAIR_RETRY_TRIED=1
+        FROM_CACHE=1
     else
         # Nothing to connect to. If a device is sitting on the pairing screen
         # right now, that is almost certainly what the user wants, so handle it
@@ -493,27 +499,36 @@ main_connect() {
         printf '%s' "$connected" > "$STATE_FILE"
     fi
 
-    if [ "$ok" -eq 0 ] && [ "${PAIR_RETRY_TRIED:-0}" -eq 0 ] && require_qr; then
-        PAIR_RETRY_TRIED=1
+    if [ "$ok" -eq 0 ]; then
         if [ "$unreachable" -eq 1 ]; then
-            # Nothing is listening. avahi keeps serving a cached record for a
-            # while after wireless debugging is switched off, so an advert here
-            # proves nothing - the fix is to turn it back on, not to re-pair.
-            printf '\n%s\n' "${YLW}Nothing is listening on that port - wireless debugging looks OFF.${NC}"
-            printf '%s\n' "${DIM}(the advert was a stale mDNS record)${NC}"
+            # Nothing is listening on the port, so wireless debugging is off (or
+            # the endpoint is a stale cache entry / stale mDNS record pointing at
+            # a port Android has already closed). Re-pairing cannot fix this.
+            if [ "${FROM_CACHE:-0}" -eq 1 ]; then
+                printf '\n%s\n' "${YLW}That was a cached endpoint and nothing is listening on it.${NC}"
+                # The cached port is provably dead; keeping it only makes the
+                # next run repeat this same failure.
+                rm -f "$STATE_FILE"
+            else
+                printf '\n%s\n' "${YLW}Nothing is listening on that port - wireless debugging looks OFF.${NC}"
+                printf '%s\n' "${DIM}(the advert was a stale mDNS record)${NC}"
+            fi
             if bootstrap_flow; then
                 return 0
             fi
-            # bootstrap already ran this session, so the QR is on screen above.
             die "wireless debugging still appears to be off on the device."
         fi
         # The port answered but the handshake was rejected: that is a lost RSA
-        # pairing, which only re-pairing can fix.
-        printf '\n%s\n' "${YLW}Reachable but refusing to connect - the pairing was dropped.${NC}"
-        printf '%s\n' "${DIM}Re-pair by scanning this:${NC}"
-        echo
-        do_pair_qr
-        return
+        # pairing, which only re-pairing can fix. Not offered for cached
+        # endpoints, where a stale port is the likelier explanation.
+        if [ "${FROM_CACHE:-0}" -eq 0 ] && [ "${PAIR_RETRY_TRIED:-0}" -eq 0 ] && require_qr; then
+            PAIR_RETRY_TRIED=1
+            printf '\n%s\n' "${YLW}Reachable but refusing to connect - the pairing was dropped.${NC}"
+            printf '%s\n' "${DIM}Re-pair by scanning this:${NC}"
+            echo
+            do_pair_qr
+            return
+        fi
     fi
 
     printf '\n%s\n' "${BLU}adb devices:${NC}"
