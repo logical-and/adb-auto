@@ -1,0 +1,133 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 1200px;
+    background: #0d1117;
+    color: #e6edf3;
+    font-family: "Liberation Sans", "DejaVu Sans", sans-serif;
+    padding: 44px 48px 40px;
+  }
+  .head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 6px; }
+  h1 { font-size: 34px; letter-spacing: -0.5px; }
+  .tag { font-size: 16px; color: #7d8590; }
+  .lede { font-size: 16px; color: #9aa4af; margin-bottom: 30px; }
+  .lede b { color: #e6edf3; font-weight: 600; }
+
+  .flow { display: flex; align-items: stretch; gap: 0; margin-bottom: 34px; }
+  .step {
+    flex: 1;
+    background: #161b22;
+    border: 1px solid #26303b;
+    border-radius: 12px;
+    padding: 18px 18px 16px;
+    position: relative;
+  }
+  .step .n {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; border-radius: 50%;
+    background: #1f6feb; color: #fff;
+    font-size: 13px; font-weight: 700; margin-bottom: 10px;
+  }
+  .step h3 { font-size: 16px; margin-bottom: 6px; letter-spacing: -0.2px; }
+  .step p { font-size: 13.5px; line-height: 1.45; color: #8b949e; }
+  .step.opt { border-style: dashed; border-color: #3d444d; }
+  .step .badge {
+    position: absolute; top: 14px; right: 14px;
+    font-size: 10.5px; letter-spacing: .4px; text-transform: uppercase;
+    color: #d29922; border: 1px solid #4d3c11; background: #2b2411;
+    padding: 2px 7px; border-radius: 20px; font-weight: 700;
+  }
+  .arrow {
+    display: flex; align-items: center; justify-content: center;
+    width: 34px; color: #3d444d; font-size: 22px; flex: none;
+  }
+
+  .term {
+    background: #010409;
+    border: 1px solid #26303b;
+    border-radius: 12px;
+    padding: 18px 22px;
+    font-family: "DejaVu Sans Mono", "Liberation Mono", monospace;
+    font-size: 14.5px;
+    line-height: 1.65;
+    margin-bottom: 30px;
+  }
+  .term .p { color: #3fb950; }
+  .term .c { color: #e6edf3; }
+  .term .d { color: #6e7681; }
+  .term .g { color: #3fb950; }
+  .term .b { color: #58a6ff; }
+
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px;
+          align-items: stretch; }
+  .card {
+    background: #161b22; border: 1px solid #26303b;
+    border-radius: 10px; padding: 14px 15px;
+  }
+  .card h4 { font-size: 13.5px; margin-bottom: 5px; color: #e6edf3; }
+  .card p { font-size: 12.5px; line-height: 1.45; color: #8b949e; }
+</style>
+
+<div class="head">
+  <h1>adb-auto</h1>
+  <span class="tag">wireless adb, without the scavenger hunt</span>
+</div>
+<p class="lede">
+  Android randomises the debugging port on <b>every toggle and every reboot</b>.
+  adb-auto finds the device over mDNS and connects.
+</p>
+
+<div class="flow">
+  <div class="step">
+    <span class="n">1</span>
+    <h3>Discover</h3>
+    <p>Asks the network who is advertising wireless debugging, and gets the current IP and port.</p>
+  </div>
+  <div class="arrow">&#8594;</div>
+  <div class="step">
+    <span class="n">2</span>
+    <h3>Verify</h3>
+    <p>Probes the port before trusting it, so a stale mDNS record can't send you chasing a dead endpoint.</p>
+  </div>
+  <div class="arrow">&#8594;</div>
+  <div class="step opt">
+    <span class="badge">only if needed</span>
+    <span class="n">3</span>
+    <h3>Pair by QR</h3>
+    <p>Never paired? A QR prints in your terminal. Scan it. Skipped whenever the phone is still paired.</p>
+  </div>
+  <div class="arrow">&#8594;</div>
+  <div class="step">
+    <span class="n">4</span>
+    <h3>Connect</h3>
+    <p>Attaches the device and clears out stale entries, leaving <span style="color:#adbac7">adb devices</span> clean.</p>
+  </div>
+</div>
+
+<div class="term">
+  <div><span class="p">$</span> <span class="c">adb-auto</span></div>
+  <div><span class="b">Advertised on the LAN:</span></div>
+  <div>&nbsp;&nbsp;10.10.10.106:43105&nbsp;&nbsp;<span class="d">SM-F966B</span></div>
+  <div>&nbsp;&nbsp;<span class="g">connected</span> 10.10.10.106:43105</div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h4>Ports that change</h4>
+    <p>Rediscovered every run, with the last good endpoint cached as a fallback.</p>
+  </div>
+  <div class="card">
+    <h4>mDNS that lies</h4>
+    <p>Cached records outlive the connection, so the port is probed first.</p>
+  </div>
+  <div class="card">
+    <h4>Docker noise</h4>
+    <p>Bridge interfaces echo one phone as a dozen candidates. Only real NICs count.</p>
+  </div>
+  <div class="card">
+    <h4>Lookalike failures</h4>
+    <p>"Refused" means debugging is off. A rejected handshake means lost pairing. Opposite fixes.</p>
+  </div>
+</div>

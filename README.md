@@ -1,5 +1,7 @@
 # adb-auto
 
+![How adb-auto works](docs/how-it-works.png)
+
 **Stop hunting for your phone's IP and port. Just run `adb-auto`.**
 
 Android randomises the wireless-debugging port every single time you toggle it or reboot. So the
