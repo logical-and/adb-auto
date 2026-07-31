@@ -39,14 +39,12 @@ adb-auto - connect adb to Android devices on the LAN automatically
 Usage:
   adb-auto            Discover and connect. When nothing is reachable it walks
                       the bootstrap:
-                        1. shows a QR that opens Settings on the phone
-                        2. you turn Wireless debugging on
-                        3. it waits for the device, then connects
-                        4. only if the device is not paired, shows a second QR
-                           for the pairing scanner, then connects
-                      Step 4 is skipped whenever the phone is still paired.
+                        1. tells you to turn Wireless debugging on
+                        2. waits for the device, then connects
+                        3. only if the device is not paired, shows a QR for the
+                           pairing scanner, then connects
+                      Step 3 is skipped whenever the phone is still paired.
   adb-auto --qr       Just the pairing QR (Wireless debugging > Pair with QR)
-  adb-auto --settings Just the QR that opens Settings on the phone
   adb-auto --pair     Pairing-code mode: waits for the phone to advertise, then
                       prompts for the 6-digit code it displays.
   adb-auto --list     Show what is advertised, connect to nothing
@@ -62,11 +60,10 @@ Notes:
   secret only on the phone screen and there is no host-side way to read it. Use
   --qr for a genuinely hands-free flow, where the host picks the secret instead.
 
-  The Settings QR opens the Settings app, not Wireless debugging directly.
-  Android only lets a scanned link open activities marked BROWSABLE, and the
-  Developer options screen is not - verified on this hardware, it refuses to
-  resolve. If a device is already attached (e.g. USB), adb-auto skips the QR
-  entirely and just turns wireless debugging on over that connection.
+  There is no QR for opening wireless debugging settings: Android does not let a
+  scanned link reach that screen (see the comment above settings_hint for the
+  full list of what was tried). If a device is already attached (e.g. over USB),
+  adb-auto turns wireless debugging on over that connection instead.
 EOF
 }
 
@@ -256,15 +253,26 @@ segno.make(sys.argv[1], error='m').terminal(compact=True)
 " "$1"
 }
 
-# A scanned QR is handed to the OS as a browser-style navigation, so Android only
-# honours targets declaring CATEGORY_BROWSABLE. Verified on this hardware:
-# APPLICATION_DEVELOPMENT_SETTINGS (Developer options) does NOT declare it and
-# fails to resolve, so a QR cannot deep-link to Wireless debugging directly.
-# android.settings.SETTINGS is browsable and does launch, so that is the target;
-# the last two taps have to be manual.
-settings_qr() {
-    require_qr || return 1
-    render_qr "intent://#Intent;action=android.settings.SETTINGS;end"
+# There is deliberately no QR for "open wireless debugging settings".
+#
+# Tested exhaustively on a Galaxy Z Fold 7 (SM-F966B, One UI, API 36), both as a
+# raw intent: QR and as a tappable link on a locally served page:
+#   - phone QR scanners only act on http(s) payloads, so an intent: QR is inert
+#   - android.settings.SETTINGS reaches the Settings ROOT only (and only with an
+#     explicit package=; Chrome silently drops package-less intents)
+#   - APPLICATION_DEVELOPMENT_SETTINGS, the Samsung action alias, an explicit
+#     component=...Settings$DevelopmentSettingsActivity, the
+#     :settings:fragment_args_key=toggle_adb_wireless hint, WIRELESS_SETTINGS and
+#     android-app://com.android.settings ALL fail: they either do nothing or
+#     bounce to the Play Store, because those activities are not exported for
+#     external launch.
+# Landing on the Settings root still leaves the user to find Developer options,
+# so the QR bought nothing over simply printing the path.
+settings_hint() {
+    printf '%s\n' "${BLU}Turn on wireless debugging on the phone:${NC}"
+    printf '%s\n' "  Settings > Developer options > Wireless debugging > ON"
+    printf '%s\n' "${DIM}  (Developer options is hidden until you tap" \
+                  "   Settings > About phone > Software information > Build number 7x)${NC}"
 }
 
 # Blocks until a service is advertised, echoing its records. Empty means timeout.
@@ -301,7 +309,7 @@ port_open() {
 }
 
 # The staged bootstrap for a phone that is not reachable at all:
-#   1. QR that opens Settings, so wireless debugging can be switched on
+#   1. tell the user to switch wireless debugging on
 #   2. wait for the device to start advertising, then just try connecting
 #   3. only if that fails (never paired, or pairing dropped) show the pairing QR
 # Step 3 is skipped whenever the phone is still paired with this machine, which
@@ -309,12 +317,9 @@ port_open() {
 bootstrap_flow() {
     [ "${BOOTSTRAP_TRIED:-0}" -eq 1 ] && return 1
     BOOTSTRAP_TRIED=1
-    require_qr || return 1
 
-    printf '\n%s\n' "${BLU}Step 1/2 - scan to open Settings on the phone${NC}"
-    printf '%s\n' "${DIM}  then: Developer options > Wireless debugging > ON${NC}"
     echo
-    settings_qr
+    settings_hint
     echo
     printf '%s\n' "${DIM}Waiting for wireless debugging to come on (${SETTINGS_WATCH_TIMEOUT}s)...${NC}"
 
@@ -324,7 +329,6 @@ bootstrap_flow() {
     fi
 
     printf '%s\n' "${GRN}Wireless debugging is on.${NC}"
-    printf '%s\n' "${BLU}Step 2/2 - connecting${NC}"
     # main_connect falls through to the pairing QR by itself when the device
     # turns out not to be paired, which is the optional step 3.
     main_connect
@@ -525,15 +529,6 @@ main() {
         --list)    list_only=1 ;;
         --pair)    resolve_adb; "$ADB" start-server >/dev/null 2>&1; do_pair; exit $? ;;
         --qr)      resolve_adb; "$ADB" start-server >/dev/null 2>&1; do_pair_qr; exit $? ;;
-        --settings)
-            resolve_adb
-            require_qr || die "needs python3 + segno: python3 -m pip install --user segno"
-            printf '%s\n' "${BLU}Scan to open Settings on the phone${NC}"
-            printf '%s\n' "${DIM}  then: Developer options > Wireless debugging > ON${NC}"
-            echo
-            settings_qr
-            exit 0
-            ;;
         "")        ;;
         *)         usage >&2; exit 1 ;;
     esac

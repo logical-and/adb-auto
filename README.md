@@ -1,13 +1,14 @@
 # adb-auto
 
-Connect `adb` to Android devices over Wi-Fi without hunting for IP addresses, ports, or pairing codes.
+**Stop hunting for your phone's IP and port. Just run `adb-auto`.**
 
-Android randomises the wireless-debugging port on every toggle and every reboot, so yesterday's
-`adb connect 192.168.1.50:37401` is dead today. `adb-auto` discovers the current endpoint over mDNS
-and connects. When nothing is reachable, it walks you through a QR-code bootstrap instead of failing
-with instructions.
+Android randomises the wireless-debugging port every single time you toggle it or reboot. So the
+command that worked yesterday is dead today, and you are back in Settings squinting at a
+`192.168.1.x:41055` that will be wrong again in an hour.
 
-```
+`adb-auto` finds the device and connects. That is the whole idea.
+
+```console
 $ adb-auto
 Advertised on the LAN:
   10.10.10.106:43105  SM-F966B
@@ -18,6 +19,9 @@ adb devices:
 emulator-5554          device product:sdk_gphone64_x86_64 model:sdk_gphone64_x86_64
 ```
 
+No IP to type. No port to look up. No pairing code, unless the phone has genuinely never been paired
+with this machine, and even then it hands you a QR instead of six digits.
+
 ## Install
 
 ```bash
@@ -25,94 +29,99 @@ curl -o ~/.local/bin/adb-auto https://raw.githubusercontent.com/logical-and/adb-
 chmod +x ~/.local/bin/adb-auto
 ```
 
-Requirements:
+One file, no runtime, no daemon. Requires:
 
-- `adb` (Android SDK platform-tools) on `PATH`, or set `ADB=/path/to/adb`
-- `avahi-utils` for discovery (`sudo apt install avahi-utils`)
-- optional, for the QR flows: `python3` plus `segno` (`python3 -m pip install --user segno`)
+- `adb` on `PATH` (or set `ADB=/path/to/adb`)
+- `avahi-utils` for discovery: `sudo apt install avahi-utils`
+- optional, only for QR pairing: `python3 -m pip install --user segno`
 
 ## Usage
 
 ```
-adb-auto            Discover and connect. Falls back to the QR bootstrap when
-                    nothing is reachable.
-adb-auto --qr       Pairing QR only
-adb-auto --settings QR that opens Settings on the phone
-adb-auto --pair     Pairing-code mode (prompts for the 6 digits)
+adb-auto            Discover and connect
+adb-auto --qr       Pair by QR (nothing to type)
+adb-auto --pair     Pair with the 6-digit code
 adb-auto --list     Show what is advertised, connect to nothing
 ```
 
-### The bootstrap
+### It bootstraps itself
 
-Run `adb-auto` with nothing connected and it stages the setup, skipping any step you do not need:
+Run it with nothing connected and it walks you in, skipping every step you do not need:
 
-1. Shows a QR that opens **Settings** on the phone
-2. You turn on Developer options > Wireless debugging
-3. It detects the device and tries to connect
-4. Only if the device is not paired, shows a **second** QR for the pairing scanner
-5. Connects
+1. Tells you to switch Wireless debugging on
+2. Notices the device the moment it appears, and connects
+3. Only if the phone is not paired, shows a QR for the pairing scanner
+4. Connects
 
-Step 4 is skipped whenever the phone is still paired with the machine, which is the usual case after
-a reboot or a toggle.
+Step 3 is skipped whenever the phone is still paired, which is the usual case after a reboot or a
+toggle. And if the phone happens to be plugged in over USB, all of it is skipped: `adb-auto` just
+switches wireless debugging on itself with `settings put global adb_wifi_enabled 1`, no root needed.
 
-## Why the QR opens Settings and not Wireless debugging
+### Pairing without typing anything
 
-Because Android will not allow anything else. A scanned QR is delivered to the system as a
-browser-style navigation, and Android only honours activities that declare `CATEGORY_BROWSABLE`.
-The Developer options screen does not:
+`adb-auto --qr` prints a QR straight into your terminal. Scan it with the phone's own pairing
+scanner and you are connected.
 
-```
-$ adb shell am start -a android.settings.APPLICATION_DEVELOPMENT_SETTINGS \
-    -c android.intent.category.BROWSABLE
-Error: Activity not started, unable to resolve Intent
+This works because the direction is inverted: in code mode Android generates the secret and shows it
+only on the phone, so no tool can read it. In QR mode **the host** generates the secret and the
+phone's camera reads it. Nothing to transcribe.
 
-$ adb shell am start -a android.settings.SETTINGS -c android.intent.category.BROWSABLE
-Starting: Intent { act=android.settings.SETTINGS cat=[android.intent.category.BROWSABLE] }
-```
+## The sharp edges it files down
 
-`android.settings.ADB_WIRELESS_SETTINGS` does not resolve at all on the devices tested (Samsung
-SM-F966B on API 36, and the AOSP emulator). So the QR encodes
-`intent://#Intent;action=android.settings.SETTINGS;end` and the last two taps stay manual.
+Most of this tool is not "run adb connect". It is the pile of failure modes that make wireless adb
+miserable:
 
-If a device is already attached over USB, `adb-auto` skips the QR entirely and enables wireless
-debugging directly with `settings put global adb_wifi_enabled 1`, which needs no root.
+**Ports that change under you.** Rediscovered every run. The last working endpoint is cached and
+retried for when the phone stops advertising (screen asleep) but keeps the port open.
 
-## What it handles
+**`adb devices` filling with corpses.** Stale `ip:port` entries from earlier toggles get
+disconnected automatically. Entries for other IPs and for emulators are never touched.
 
-**Ports that change.** The endpoint is rediscovered on every run. The last working one is cached and
-retried when the phone stops advertising (screen asleep) but keeps the port open.
+**Two failures that look identical and need opposite fixes.** `Connection refused` means wireless
+debugging is off, so it tells you to turn it on. A device that answers but rejects the handshake has
+lost its RSA pairing, so it offers the pairing QR. Guessing wrong here wastes real time.
 
-**Stale adb entries.** Old `ip:port` entries left over from previous toggles are disconnected, so
-`adb devices` does not fill up with dead transports. Entries for other IPs and for emulators are
-never touched.
+**mDNS lying to you.** Avahi keeps serving a cached record after wireless debugging is switched off,
+so an advert alone proves nothing. The port gets probed before a device counts as ready.
 
-**Telling failures apart.** `Connection refused` means wireless debugging is off, so it offers the
-Settings QR. A device that answers but rejects the handshake has lost its RSA pairing, so it offers
-the pairing QR. These look identical in `adb devices` and need opposite fixes.
+**Docker turning one phone into twelve.** Bridge interfaces echo the same advert on every virtual
+link. Only real interfaces are considered.
 
-**Stale mDNS records.** Avahi keeps serving a cached record for a while after wireless debugging is
-switched off, so an advert alone is not trusted: the port is probed before a device counts as ready.
+**Silent double-listing.** `ADB_MDNS_OPENSCREEN=1` fixes adb's own discovery but auto-connects
+devices under an mDNS-name serial, so a phone also reached by `ip:port` appears **twice**. That
+quietly breaks any script that counts devices or picks "the non-emulator one". `adb-auto` avoids the
+flag and actively removes the duplicates.
 
-**Multi-homed hosts.** Docker and libvirt bridges echo the same mDNS advert on every virtual
-interface, turning one phone into a dozen unroutable candidates. Only real interfaces are considered.
+## Why discovery uses avahi, not `adb mdns services`
 
-## Discovery
+On many setups adb's default `libadbmdns` backend returns an empty list while `avahi-browse`
+resolves the same records in about a second. That single fact is the difference between this tool
+working and a minutes-long `nmap` port sweep.
 
-Discovery goes through `avahi-browse`, not `adb mdns services`. On many setups adb's default
-`libadbmdns` backend returns an empty list while avahi resolves the same records instantly.
+## Why there is no QR for "open wireless debugging"
 
-`ADB_MDNS_OPENSCREEN=1` also fixes adb's own discovery, but `adb-auto` deliberately avoids it: that
-backend auto-connects devices under an mDNS-name serial
-(`adb-<guid>._adb-tls-connect._tcp`), so a phone also reached by `ip:port` appears **twice** in
-`adb devices`. That breaks scripts that count attached devices or pick "the non-emulator one".
-`adb-auto` actively removes those duplicates.
+It is the obvious feature request, and Android will not allow it. Tested on a Galaxy Z Fold 7
+(SM-F966B, One UI, API 36), both as raw QR payloads and as tappable links on a locally served page:
 
-## Note on pairing codes
+| Attempt | Result |
+| --- | --- |
+| `intent://...action=android.settings.SETTINGS;end` | nothing (Chrome drops package-less intents) |
+| `intent:...SETTINGS;package=com.android.settings;end` | opens the Settings **root** only |
+| `...APPLICATION_DEVELOPMENT_SETTINGS;package=...` | bounces to the Play Store |
+| `component=...Settings$DevelopmentSettingsActivity` | bounces to the Play Store |
+| `com.android.settings.APPLICATION_DEVELOPMENT_SETTINGS` | fails to resolve |
+| `:settings:fragment_args_key=toggle_adb_wireless` | opens the root, ignores the hint |
+| `android.settings.WIRELESS_SETTINGS` | network settings, not debugging |
+| `android-app://com.android.settings` | nothing |
+| `com.android.settings.action.SETTINGS_SEARCH` | not `BROWSABLE`, fails to resolve |
 
-Pairing cannot be fully automated in pairing-code mode. Android generates the 6-digit secret and
-displays it only on the phone, with no host-side way to read it. Everything else is automatic. Use
-`--qr`, where the host generates the secret and the phone's camera reads it, for a flow with nothing
-to type.
+Two reasons cover all of it. Phone QR scanners only act on `http(s)` payloads, so an `intent:` QR is
+inert. And Android only honours scanned links resolving to an activity that declares
+`CATEGORY_BROWSABLE`, which Developer options does not, so it is unreachable from a browser even
+though `adb shell am start -n com.android.settings/.Settings$DevelopmentSettingsActivity` works fine.
+
+Landing on the Settings root still left you hunting for Developer options, so the QR bought nothing
+over printing the path. `adb-auto` prints the path.
 
 ## License
 
