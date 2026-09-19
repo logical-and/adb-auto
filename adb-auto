@@ -88,8 +88,16 @@ resolve_adb() {
 # record of a service. The raw instance name is kept as a separate field because
 # the friendly name is overwritten from the TXT record when one is present, and
 # QR pairing has to match on the instance name it asked the phone to use.
-# IPv6 records are skipped: adb needs bracket syntax and link-local addresses
+# IPv6 ADDRESSES are skipped: adb needs bracket syntax and link-local addresses
 # additionally need a %scope suffix it does not handle.
+#
+# The skip tests the resolved address ($8), NOT avahi's protocol column ($3).
+# Those are different things: $3 is the transport the mDNS query travelled over,
+# and a record received over IPv6 mDNS can still carry an IPv4 A record. Android
+# does exactly that - a phone whose adb service is only discovered over IPv6
+# multicast still advertises its IPv4 address and adb port. Filtering on $3
+# dropped that record and made the device invisible even though it was
+# advertising, reachable, and had a working IPv4 endpoint.
 discover() {
     command -v avahi-browse >/dev/null 2>&1 || return 1
     # pipefail off locally: avahi-browse exiting nonzero (or being killed by
@@ -99,7 +107,7 @@ discover() {
         # $2 is the interface. Docker/libvirt bridges echo the same advert back
         # on every virtual link, which on this host multiplies one device into
         # a dozen unroutable candidates.
-        $1 == "=" && $3 == "IPv4" && $8 != "" && $9 != "" &&
+        $1 == "=" && $8 ~ /^[0-9]+(\.[0-9]+){3}$/ && $9 != "" &&
         $2 !~ /^(br-|docker|veth|virbr|lo$)/ {
             name = $4
             for (i = 10; i <= NF; i++)
