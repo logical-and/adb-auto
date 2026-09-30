@@ -252,13 +252,21 @@ enable_wireless_on_attached() {
     return 1
 }
 
+# Picks a python that can import segno. Distro pythons are usually
+# externally-managed (PEP 668), so `pip install --user` fails there; uv can
+# supply segno in a throwaway env without installing anything.
 require_qr() {
-    command -v python3 >/dev/null 2>&1 || return 1
-    python3 -c "import segno" 2>/dev/null || return 1
+    if command -v python3 >/dev/null 2>&1 && python3 -c "import segno" 2>/dev/null; then
+        QR_PY=(python3)
+    elif command -v uv >/dev/null 2>&1 && uv run --quiet --with segno python3 -c "import segno" 2>/dev/null; then
+        QR_PY=(uv run --quiet --with segno python3)
+    else
+        return 1
+    fi
 }
 
 render_qr() {
-    python3 -c "
+    "${QR_PY[@]}" -c "
 import segno, sys
 segno.make(sys.argv[1], error='m').terminal(compact=True)
 " "$1"
@@ -375,7 +383,7 @@ do_pair() {
 # which is what lets us recognise our own QR scan rather than some other device.
 do_pair_qr() {
     local instance secret payload found name deadline
-    require_qr || die "QR pairing needs python3 + segno: python3 -m pip install --user segno"
+    require_qr || die "QR pairing needs segno: install uv, or: python3 -m pip install --user segno"
 
     instance="studio-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c10)"
     secret=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c12)
@@ -460,7 +468,7 @@ main_connect() {
 
     drop_stale "$endpoints"
 
-    local endpoint state reply ok=0 unreachable=0 connected=""
+    local endpoint state reply ok=0 unreachable=0 rejected=0 connected=""
     while read -r endpoint; do
         [ -n "$endpoint" ] || continue
         # Captured rather than piped into grep -q: with pipefail, grep exiting
@@ -480,8 +488,12 @@ main_connect() {
             # entry for a port Android has since dropped). That is a completely
             # different problem from a device that answers but refuses to
             # authenticate, which is what a lost pairing looks like.
-            [[ $reply == *"Connection refused"* || $reply == *"No route to host"* \
-               || $reply == *"timed out"* ]] && unreachable=1
+            if [[ $reply == *"Connection refused"* || $reply == *"No route to host"* \
+               || $reply == *"timed out"* ]]; then
+                unreachable=1
+            else
+                rejected=1
+            fi
             continue
         fi
         state=$(settle_state "$endpoint")
@@ -497,6 +509,7 @@ main_connect() {
                 printf '%s\n' "${RED}  offline${NC} $endpoint - pairing was dropped by Android."
                 printf '%s\n' "  Re-pair on the phone, then run: ${BLU}adb-auto --pair${NC}"
                 "$ADB" disconnect "$endpoint" >/dev/null 2>&1
+                rejected=1
                 ;;
             unauthorized)
                 printf '%s\n' "${RED}  unauthorized${NC} $endpoint - accept the debugging prompt on the phone."
@@ -513,7 +526,12 @@ main_connect() {
     fi
 
     if [ "$ok" -eq 0 ]; then
-        if [ "$unreachable" -eq 1 ]; then
+        # A phone often advertises its live port next to a stale mDNS record for
+        # a port it has since closed. The stale one is refused, but the live one
+        # rejecting the handshake is the real story, so "unreachable" only wins
+        # when no endpoint answered at all - otherwise the lost pairing would be
+        # misread as wireless debugging being OFF and re-pairing never offered.
+        if [ "$unreachable" -eq 1 ] && [ "$rejected" -eq 0 ]; then
             # Nothing is listening on the port, so wireless debugging is off (or
             # the endpoint is a stale cache entry / stale mDNS record pointing at
             # a port Android has already closed). Re-pairing cannot fix this.
@@ -541,6 +559,9 @@ main_connect() {
             echo
             do_pair_qr
             return
+        fi
+        if [ "$rejected" -eq 1 ] && [ "${FROM_CACHE:-0}" -eq 0 ]; then
+            printf '\n%s\n' "${YLW}Reachable but refusing to connect - re-pair with: ${BLU}adb-auto --pair${NC}"
         fi
     fi
 

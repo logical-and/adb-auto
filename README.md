@@ -35,7 +35,7 @@ One file, no runtime, no daemon. Requires:
 
 - `adb` on `PATH` (or set `ADB=/path/to/adb`)
 - `avahi-utils` for discovery: `sudo apt install avahi-utils`
-- optional, only for QR pairing: `python3 -m pip install --user segno`
+- optional, only for QR pairing: `segno` (`python3 -m pip install --user segno`), or just have `uv` on PATH and adb-auto pulls segno in on demand
 
 ## Usage
 
